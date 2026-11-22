@@ -1,5 +1,5 @@
 {
-  "n_features": 31,
+  "n_features": 34,
   "feature_names": [
     "x_FA",
     "x_MA",
@@ -31,9 +31,30 @@
     "htl_thickness",
     "Delta_H",
     "Delta_L",
-    "is_pin"
+    "is_pin",
+    "etl_material_encoded",
+    "htl_material_encoded",
+    "substrate_encoded"
   ],
-  "n_train": 8404,
-  "n_val": 1800,
-  "n_test": 1796
+  "n_train": 24949,
+  "n_val": 5349,
+  "n_test": 5341,
+  "target_means": [
+    12.77208506553369,
+    0.9885030261733937,
+    18.892024129223618,
+    0.6650513447432762
+  ],
+  "target_stds": [
+    4.479529077862486,
+    0.1230617544226023,
+    4.078980971504016,
+    0.10066474409710492
+  ],
+  "target_names": [
+    "PCE",
+    "Voc",
+    "Jsc",
+    "FF"
+  ]
 }

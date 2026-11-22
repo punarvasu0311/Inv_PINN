@@ -16,6 +16,69 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 
+def transform_to_unconstrained(
+    x: torch.Tensor,
+    pb_max: Optional[torch.Tensor] = None,
+    eps: float = 1e-4
+) -> torch.Tensor:
+    """
+    Transform raw physical design parameters into unconstrained space
+    with small dequantization noise so RealNVP can model them without boundary singularities.
+    x has shape (N, 14):
+      [0:3]   -> A-site (FA, MA, Cs) summing to 1
+      [3:5]   -> B-site (Pb, Sn) summing to 1
+      [5:8]   -> X-site (I, Br, Cl) summing to 1
+      [8:11]  -> thicknesses (absorber, ETL, HTL) in nm
+      [11:13] -> offsets (Delta_H, Delta_L) in eV
+      [13:14] -> is_pin (binary 0 or 1)
+    """
+    device = x.device
+    noise = torch.randn_like(x) * 1e-3
+
+    # 1. A-site: [0:3]
+    a = torch.clamp(x[:, 0:3] + torch.abs(noise[:, 0:3]), min=eps)
+    a = a / a.sum(dim=-1, keepdim=True)
+    logit_a = torch.log(a) - torch.mean(torch.log(a), dim=-1, keepdim=True)
+
+    # 2. B-site: [3:5] (Pb and Sn)
+    if pb_max is not None:
+        p_cap = torch.clamp(pb_max, min=0.05, max=1.0)
+        if p_cap.ndim == 1:
+            p_cap = p_cap.unsqueeze(-1)
+        pb_norm = torch.clamp(x[:, 3:4] / p_cap, min=eps, max=1.0 - eps)
+    else:
+        pb_norm = torch.clamp(x[:, 3:4], min=eps, max=1.0 - eps)
+    logit_pb = torch.logit(pb_norm)
+    sn_norm = torch.clamp(x[:, 4:5], min=eps, max=1.0 - eps)
+    logit_sn = torch.logit(sn_norm)
+
+    # 3. X-site: [5:8]
+    x_site = torch.clamp(x[:, 5:8] + torch.abs(noise[:, 5:8]), min=eps)
+    x_site = x_site / x_site.sum(dim=-1, keepdim=True)
+    logit_x = torch.log(x_site) - torch.mean(torch.log(x_site), dim=-1, keepdim=True)
+
+    # 4. Thicknesses: [8:11] (absorber in [200, 800], etl in [15, 100], htl in [20, 220])
+    t_abs = x[:, 8:9] * 500.0 if x[:, 8:9].mean() < 10.0 else x[:, 8:9]
+    t_etl = x[:, 9:10] * 500.0 if x[:, 9:10].mean() < 10.0 else x[:, 9:10]
+    t_htl = x[:, 10:11] * 500.0 if x[:, 10:11].mean() < 10.0 else x[:, 10:11]
+
+    u_abs = torch.clamp((t_abs - 200.0) / 600.0, min=eps, max=1.0 - eps)
+    u_etl = torch.clamp((t_etl - 15.0) / 85.0, min=eps, max=1.0 - eps)
+    u_htl = torch.clamp((t_htl - 20.0) / 200.0, min=eps, max=1.0 - eps)
+    logit_t = torch.logit(torch.cat([u_abs, u_etl, u_htl], dim=-1))
+
+    # 5. Energy offsets: [11:13] (Delta_H in [-0.1, 0.6], Delta_L in [-0.1, 0.5])
+    u_dh = torch.clamp((x[:, 11:12] - (-0.1)) / 0.7, min=eps, max=1.0 - eps)
+    u_dl = torch.clamp((x[:, 12:13] - (-0.1)) / 0.6, min=eps, max=1.0 - eps)
+    logit_off = torch.logit(torch.cat([u_dh, u_dl], dim=-1))
+
+    # 6. is_pin: [13:14] (binary with dequantization)
+    u_pin = torch.clamp(x[:, 13:14] * 0.8 + 0.1 + noise[:, 13:14] * 0.05, min=eps, max=1.0 - eps)
+    logit_pin = torch.logit(u_pin)
+
+    return torch.cat([logit_a, logit_pb, logit_sn, logit_x, logit_t, logit_off, logit_pin], dim=-1)
+
+
 class ConditionalAffineCoupling(nn.Module):
     """
     Conditional Affine Coupling Layer:
@@ -156,34 +219,34 @@ class ConditionalRealNVP(nn.Module):
         for layer in reversed(self.layers):
             x = layer.inverse(x, c_embed)
 
-        # Map unconstrained flow outputs into physically valid chemical design spaces
-        # Layout:
-        # [0:3] -> A-site logits
-        # [3]   -> Pb ratio logit
-        # [4:7] -> X-site logits
-        # [7:10]-> thicknesses raw
-        # [10:12]-> offsets raw
-        # [12]  -> is_pin raw
+        # Map unconstrained flow outputs into physically valid chemical design spaces (14 dims):
+        # [0:3]   -> A-site logits
+        # [3:4]   -> Pb ratio logit
+        # [4:5]   -> Sn logit
+        # [5:8]   -> X-site logits (I, Br, Cl)
+        # [8:11]  -> thicknesses raw (absorber, ETL, HTL)
+        # [11:13] -> offsets raw (Delta_H, Delta_L)
+        # [13:14] -> is_pin raw
 
         a_site = F.softmax(x[:, 0:3], dim=-1)
         pb_ratio = torch.sigmoid(x[:, 3:4]) * float(Pb_max)
         b_site = torch.cat([pb_ratio, 1.0 - pb_ratio], dim=-1)
-        x_site = F.softmax(x[:, 4:7], dim=-1)
+        x_site = F.softmax(x[:, 5:8], dim=-1)
 
-        t_raw = torch.sigmoid(x[:, 7:10])
+        t_raw = torch.sigmoid(x[:, 8:11])
         thicknesses = torch.cat([
             200.0 + t_raw[:, 0:1] * 600.0,
             15.0 + t_raw[:, 1:2] * 85.0,
             20.0 + t_raw[:, 2:3] * 200.0
         ], dim=-1)
 
-        off_raw = torch.sigmoid(x[:, 10:12])
+        off_raw = torch.sigmoid(x[:, 11:13])
         offsets = torch.cat([
             -0.1 + off_raw[:, 0:1] * 0.7,
             -0.1 + off_raw[:, 1:2] * 0.6
         ], dim=-1)
 
-        is_pin = torch.sigmoid(x[:, 12:13])
+        is_pin = torch.sigmoid(x[:, 13:14])
 
         return {
             'a_site': a_site,

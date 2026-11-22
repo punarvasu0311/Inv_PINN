@@ -36,6 +36,8 @@ def candidate_dict_to_dataframe(candidates: Dict[str, Any], n_samples: int) -> p
     offsets = to_np(candidates['offsets'])
     is_pin = to_np(candidates['is_pin']).squeeze()
 
+    has_mats = 'etl_material' in candidates and 'htl_material' in candidates and 'substrate' in candidates
+
     records = []
     for i in range(n_samples):
         pin_flag = float(is_pin[i]) > 0.5
@@ -43,9 +45,14 @@ def candidate_dict_to_dataframe(candidates: Dict[str, Any], n_samples: int) -> p
         compat = COMPATIBILITY_DICT[arch]
         
         # Pick compatible transport layers
-        etl = compat['etl'][i % len(compat['etl'])]
-        htl = compat['htl'][i % len(compat['htl'])]
-        tco = compat['tco'][0]
+        if has_mats:
+            etl = str(candidates['etl_material'][i])
+            htl = str(candidates['htl_material'][i])
+            tco = str(candidates['substrate'][i])
+        else:
+            etl = compat['etl'][i % len(compat['etl'])]
+            htl = compat['htl'][i % len(compat['htl'])]
+            tco = compat['tco'][0]
 
         records.append({
             'x_FA': float(a_site[i, 0]),
@@ -158,7 +165,7 @@ class CandidateEvaluator:
 
 
 def bayesian_refinement_optuna(
-    best_candidate: pd.Series,
+    best_candidates: Any,
     target_pv: np.ndarray,
     evaluator: CandidateEvaluator,
     Pb_max: float = 1.0,
@@ -166,43 +173,66 @@ def bayesian_refinement_optuna(
     seed: int = 42
 ) -> pd.DataFrame:
     """
-    Local Bayesian optimization refinement around a promising candidate using Optuna.
-    Enforces all hard constraints:
+    Local Bayesian optimization refinement around promising candidates using Optuna.
+    Enqueues initial trial(s) from candidate generator and constrains search ranges
+    locally around the primary candidate while enforcing all hard constraints:
       - Simplex A-site (FA+MA+Cs=1)
       - Simplex B-site (Pb+Sn=1, Pb <= Pb_max)
       - Simplex X-site (I+Br+Cl=1)
       - Physical layer thicknesses & energy levels
+      - Experimental device stack compatibility
     """
-    arch = best_candidate['cell_arch']
+    if isinstance(best_candidates, pd.DataFrame):
+        cands = best_candidates.head(5)
+        primary = cands.iloc[0]
+    else:
+        cands = pd.DataFrame([best_candidates])
+        primary = best_candidates
+
+    arch = str(primary['cell_arch'])
     compat = COMPATIBILITY_DICT[arch]
+
+    p_fa = float(primary['x_FA'])
+    p_ma = float(primary['x_MA'])
+    p_cs = float(primary['x_Cs'])
+    p_pb = float(primary['x_Pb'])
+    p_i = float(primary['x_I'])
+    p_br = float(primary['x_Br'])
+    p_cl = float(primary['x_Cl'])
+    p_abs = float(primary['absorber_thickness'])
+    p_etl = float(primary['etl_thickness'])
+    p_htl = float(primary['htl_thickness'])
+    p_dh = float(primary['Delta_H'])
+    p_dl = float(primary['Delta_L'])
+    pb_cap_val = float(Pb_max)
 
     def objective(trial: optuna.Trial) -> float:
         # A-site sampling on simplex
-        u_fa = trial.suggest_float('u_fa', 0.05, 0.95)
-        u_ma = trial.suggest_float('u_ma', 0.05, 0.95)
-        u_cs = trial.suggest_float('u_cs', 0.01, 0.50)
+        u_fa = trial.suggest_float('u_fa', 0.01, 0.99)
+        u_ma = trial.suggest_float('u_ma', 0.01, 0.99)
+        u_cs = trial.suggest_float('u_cs', 0.00, 0.50)
         tot_a = u_fa + u_ma + u_cs
         x_FA, x_MA, x_Cs = u_fa / tot_a, u_ma / tot_a, u_cs / tot_a
 
         # B-site sampling with hard Pb cap
-        x_Pb = trial.suggest_float('x_Pb', 0.0, float(Pb_max))
+        x_Pb = trial.suggest_float('x_Pb', 0.0, pb_cap_val)
         x_Sn = 1.0 - x_Pb
 
         # X-site sampling on simplex
-        u_i = trial.suggest_float('u_i', 0.40, 1.0)
-        u_br = trial.suggest_float('u_br', 0.0, 0.50)
-        u_cl = trial.suggest_float('u_cl', 0.0, 0.15)
+        u_i = trial.suggest_float('u_i', 0.20, 1.0)
+        u_br = trial.suggest_float('u_br', 0.00, 0.60)
+        u_cl = trial.suggest_float('u_cl', 0.00, 0.25)
         tot_x = u_i + u_br + u_cl
         x_I, x_Br, x_Cl = u_i / tot_x, u_br / tot_x, u_cl / tot_x
 
         # Thicknesses within fine-tuned ranges around initial candidate
-        abs_t = trial.suggest_float('absorber_thickness', 250.0, 750.0)
-        etl_t = trial.suggest_float('etl_thickness', 20.0, 80.0)
-        htl_t = trial.suggest_float('htl_thickness', 30.0, 180.0)
+        abs_t = trial.suggest_float('absorber_thickness', max(200.0, p_abs - 200.0), min(800.0, p_abs + 200.0))
+        etl_t = trial.suggest_float('etl_thickness', max(15.0, p_etl - 30.0), min(100.0, p_etl + 30.0))
+        htl_t = trial.suggest_float('htl_thickness', max(20.0, p_htl - 60.0), min(220.0, p_htl + 60.0))
 
         # Offsets
-        delta_h = trial.suggest_float('Delta_H', 0.05, 0.50)
-        delta_l = trial.suggest_float('Delta_L', 0.05, 0.45)
+        delta_h = trial.suggest_float('Delta_H', max(-0.1, p_dh - 0.20), min(0.60, p_dh + 0.20))
+        delta_l = trial.suggest_float('Delta_L', max(-0.1, p_dl - 0.20), min(0.50, p_dl + 0.20))
 
         etl_mat = trial.suggest_categorical('etl_material', compat['etl'])
         htl_mat = trial.suggest_categorical('htl_material', compat['htl'])
@@ -228,6 +258,31 @@ def bayesian_refinement_optuna(
 
     sampler = optuna.samplers.TPESampler(seed=seed)
     study = optuna.create_study(direction='minimize', sampler=sampler)
+
+    # Initialize / enqueue trials from the generator's top candidates (Bug 5 fix)
+    for _, c_row in cands.iterrows():
+        try:
+            etl_val = c_row['etl_material'] if c_row['etl_material'] in compat['etl'] else compat['etl'][0]
+            htl_val = c_row['htl_material'] if c_row['htl_material'] in compat['htl'] else compat['htl'][0]
+            study.enqueue_trial({
+                'u_fa': float(c_row['x_FA']),
+                'u_ma': float(c_row['x_MA']),
+                'u_cs': float(c_row['x_Cs']),
+                'x_Pb': float(min(c_row['x_Pb'], pb_cap_val)),
+                'u_i': float(c_row['x_I']),
+                'u_br': float(c_row['x_Br']),
+                'u_cl': float(c_row['x_Cl']),
+                'absorber_thickness': float(c_row['absorber_thickness']),
+                'etl_thickness': float(c_row['etl_thickness']),
+                'htl_thickness': float(c_row['htl_thickness']),
+                'Delta_H': float(c_row['Delta_H']),
+                'Delta_L': float(c_row['Delta_L']),
+                'etl_material': etl_val,
+                'htl_material': htl_val,
+            })
+        except Exception as e:
+            logger.warning(f"Could not enqueue trial: {e}")
+
     study.optimize(objective, n_trials=n_trials)
 
     # Collect all evaluated trials into a DataFrame

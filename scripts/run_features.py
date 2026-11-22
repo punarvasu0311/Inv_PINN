@@ -46,7 +46,9 @@ def main():
     phys_cols = ['r_A_eff', 'r_B_eff', 'r_X_eff', 'tau', 'mu', 'tau_mu', 'S_A',
                  'Delta_chi_BX', 'Delta_chi_AX', 'Eg_vegard', 'eta_SQ', 'Voc_SQ', 'Jsc_max_SQ',
                  'x_FA_x_I', 'x_Sn_x_I', 'x_FA_x_Br', 'x_Pb_x_I']
-    device_cols = ['absorber_thickness', 'etl_thickness', 'htl_thickness', 'Delta_H', 'Delta_L', 'is_pin']
+    # Include stack materials: etl_material, htl_material, substrate (Bug 3 fix)
+    device_cols = ['absorber_thickness', 'etl_thickness', 'htl_thickness', 'Delta_H', 'Delta_L', 'is_pin',
+                   'etl_material', 'htl_material', 'substrate']
 
     feature_cols = comp_cols + phys_cols + device_cols
 
@@ -55,7 +57,7 @@ def main():
     preprocessor.fit(train_feat, feature_cols=feature_cols)
     preprocessor.save(proc_dir / 'preprocessor.pkl')
 
-    # Transform all splits
+    # Transform all splits: X_scaled has all numeric + encoded materials; y is in PHYSICAL UNITS
     X_train, y_train = preprocessor.transform(train_feat)
     X_val, y_val = preprocessor.transform(val_feat)
     X_test, y_test = preprocessor.transform(test_feat)
@@ -73,17 +75,21 @@ def main():
     np.save(proc_dir / 'Jsc_max_train.npy', train_feat['Jsc_max_SQ'].values.astype(np.float32))
     np.save(proc_dir / 'Eg_test.npy', test_feat['Eg_vegard'].values.astype(np.float32))
 
+    all_feat_names = preprocessor.numeric_feature_cols + [f"{c}_encoded" for c in preprocessor.cat_cols]
     feat_info = {
         'n_features': X_train.shape[1],
-        'feature_names': feature_cols,
+        'feature_names': all_feat_names,
         'n_train': len(X_train),
         'n_val': len(X_val),
         'n_test': len(X_test),
+        'target_means': preprocessor.target_means.tolist(),
+        'target_stds': preprocessor.target_stds.tolist(),
+        'target_names': preprocessor.target_cols
     }
     with open(proc_dir / 'feature_info.json', 'w') as f:
         json.dump(feat_info, f, indent=2)
 
-    logger.info(f"Feature engineering completed: {X_train.shape[1]} features extracted.")
+    logger.info(f"Feature engineering completed: {X_train.shape[1]} features extracted. Targets saved in PHYSICAL UNITS.")
 
 
 if __name__ == '__main__':

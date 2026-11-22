@@ -98,3 +98,43 @@ class TestPhysicsLossConsistency:
         assert metrics['loss_voc_eg'] > 0.1, "Voc > Eg penalty should trigger"
         assert metrics['loss_jsc_sq'] > 1.0, "Jsc > Jsc_max penalty should trigger"
         assert total_loss.item() > 5.0
+
+
+class TestPhysicalUnitsRegression:
+    """Regression tests ensuring PINN, physics loss, and violation checks operate in raw physical units."""
+
+    def test_pinn_outputs_physical_units(self):
+        from src.models.pinn import ResidualPINN
+        model = ResidualPINN(input_dim=15, hidden_dim=32, n_blocks=1)
+        model.eval()
+        x = torch.randn(20, 15)
+        pred = model(x).detach().numpy()
+
+        # PCE: >= 0
+        assert np.all(pred[:, 0] >= 0.0), "PCE must be non-negative"
+        # Voc: >= 0
+        assert np.all(pred[:, 1] >= 0.0), "Voc must be non-negative"
+        # Jsc: >= 0
+        assert np.all(pred[:, 2] >= 0.0), "Jsc must be non-negative"
+        # FF: in [0.15, 0.95]
+        assert np.all((pred[:, 3] >= 0.15) & (pred[:, 3] <= 0.95)), "FF must be in [0.15, 0.95]"
+
+    def test_physics_violation_rate_physical_vs_standardized(self):
+        from src.evaluation.metrics import compute_physics_violation_rate
+
+        # Physically sensible predictions: PCE=20.0%, Voc=1.0V, Jsc=25.0mA/cm^2, FF=0.80, Eg=1.5eV
+        valid_phys = np.array([
+            [20.0, 1.0, 25.0, 0.80],
+            [16.8, 1.05, 20.0, 0.76],
+        ])
+        eg = np.array([1.5, 1.55])
+        v_res = compute_physics_violation_rate(valid_phys, eg)
+        assert v_res['total_physics_violation_pct'] == 0.0, "Valid physical predictions must have 0% violation"
+
+        # Standardized predictions (mean 0, std 1) have negative values and fail bounds
+        standardized = np.array([
+            [-0.2, 0.5, -1.1, 0.1],
+            [1.2, -0.4, 0.3, -0.8]
+        ])
+        v_std = compute_physics_violation_rate(standardized, eg)
+        assert v_std['bounds_violation_pct'] == 100.0, "Standardized predictions must trigger bounds violations"

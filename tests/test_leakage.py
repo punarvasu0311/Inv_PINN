@@ -9,7 +9,6 @@ import numpy as np
 import pandas as pd
 
 from src.data.dataset import (
-    generate_realistic_perovskite_dataset,
     doi_grouped_train_val_test_split,
     LeakageFreePreprocessor
 )
@@ -20,7 +19,38 @@ class TestZeroDataLeakage:
 
     @pytest.fixture
     def sample_data(self):
-        return generate_realistic_perovskite_dataset(n_samples=2000, seed=42)
+        rng = np.random.RandomState(42)
+        n_samples = 600
+        # 40 distinct DOIs distributed across records
+        unique_dois = [f"10.1016/j.solmat.202{i%5}.{1000 + i}" for i in range(40)]
+        assigned_dois = [unique_dois[i % len(unique_dois)] for i in range(n_samples)]
+
+        df = pd.DataFrame({
+            'Ref_DOI': assigned_dois,
+            'x_FA': rng.uniform(0.1, 0.9, n_samples),
+            'x_MA': rng.uniform(0.1, 0.9, n_samples),
+            'x_Cs': rng.uniform(0.0, 0.3, n_samples),
+            'x_Pb': rng.uniform(0.5, 1.0, n_samples),
+            'x_Sn': rng.uniform(0.0, 0.5, n_samples),
+            'x_I': rng.uniform(0.5, 1.0, n_samples),
+            'x_Br': rng.uniform(0.0, 0.5, n_samples),
+            'x_Cl': rng.uniform(0.0, 0.1, n_samples),
+            'Eg': rng.uniform(1.2, 1.8, n_samples),
+            'absorber_thickness': rng.uniform(200.0, 800.0, n_samples),
+            'etl_thickness': rng.uniform(15.0, 100.0, n_samples),
+            'htl_thickness': rng.uniform(20.0, 220.0, n_samples),
+            'Delta_H': rng.uniform(0.0, 0.5, n_samples),
+            'Delta_L': rng.uniform(0.0, 0.5, n_samples),
+            'is_pin': rng.choice([0.0, 1.0], n_samples),
+            'etl_material': rng.choice(['TiO2-c', 'SnO2-np', 'PCBM-60'], n_samples),
+            'htl_material': rng.choice(['Spiro-OMeTAD', 'PTAA', 'NiOx-np'], n_samples),
+            'substrate': rng.choice(['FTO', 'ITO'], n_samples),
+            'PCE': rng.uniform(10.0, 25.0, n_samples),
+            'Voc': rng.uniform(0.8, 1.2, n_samples),
+            'Jsc': rng.uniform(15.0, 26.0, n_samples),
+            'FF': rng.uniform(0.60, 0.85, n_samples),
+        })
+        return df
 
     def test_strict_doi_isolation(self, sample_data):
         train_df, val_df, test_df = doi_grouped_train_val_test_split(

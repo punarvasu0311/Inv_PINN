@@ -1,9 +1,11 @@
 """
 Data acquisition, parsing, cleaning, DOI-grouped splitting, and leakage-free preprocessing
 for the Perovskite Solar Cell Inverse Design framework.
+Operates on the official Perovskite Database Project dataset.
 """
 
 import os
+import re
 import json
 import logging
 import pickle
@@ -45,201 +47,221 @@ COMPATIBILITY_DICT = {
 }
 
 RAW_URLS = [
-    "https://raw.githubusercontent.com/j-jacobsson/perovskitedatabase/main/data/Perovskite_database_content_all_data.csv",
-    "https://zenodo.org/record/4287846/files/Perovskite_database_content_all_data.csv",
+    "https://media.githubusercontent.com/media/Jesperkemist/perovskitedatabase_data/main/data/Perovskite_database_content_all_data.csv",
+    "https://zenodo.org/records/5838596/files/Perovskite_database_content_all_data.csv",
 ]
 
 
 def download_dataset(raw_dir: Path) -> Path:
-    """Download the official dataset or fallback to local / synthetic generation."""
+    """Download the official Perovskite Database Project CSV."""
     raw_dir = Path(raw_dir)
     raw_dir.mkdir(parents=True, exist_ok=True)
     target_path = raw_dir / "Perovskite_database_content_all_data.csv"
     
-    if target_path.exists() and target_path.stat().st_size > 1024:
-        logger.info(f"Dataset already exists at {target_path} ({target_path.stat().st_size} bytes)")
+    # If file already exists and is large (> 50 MB), use it directly
+    if target_path.exists() and target_path.stat().st_size > 50 * 1024 * 1024:
+        logger.info(f"Official Perovskite Database dataset already exists at {target_path} ({target_path.stat().st_size / 1024 / 1024:.1f} MB)")
         return target_path
 
-    logger.info("Attempting to download Perovskite Database dataset...")
+    logger.info("Downloading official Perovskite Database dataset from remote repository...")
     download_success = False
     for url in RAW_URLS:
         try:
             logger.info(f"Connecting to {url}...")
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=10) as resp, open(target_path, 'wb') as f:
-                f.write(resp.read())
-            if target_path.stat().st_size > 1024:
+            with urllib.request.urlopen(req, timeout=30) as resp, open(target_path, 'wb') as f:
+                total = int(resp.headers.get('Content-Length', 0))
+                downloaded = 0
+                chunk_size = 1024 * 1024
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+            if target_path.stat().st_size > 10 * 1024 * 1024:
                 download_success = True
-                logger.info(f"Downloaded successfully from {url}")
+                logger.info(f"Successfully downloaded {target_path.stat().st_size / 1024 / 1024:.1f} MB from {url}")
                 break
         except Exception as e:
             logger.warning(f"Download attempt failed for {url}: {e}")
 
     if not download_success:
-        logger.warning("Could not download raw dataset from remote mirrors. Generating high-fidelity realistic dataset...")
-        df_synth = generate_realistic_perovskite_dataset(n_samples=12000, seed=42)
-        df_synth.to_csv(target_path, index=False)
-        logger.info(f"Generated realistic dataset with {len(df_synth)} records at {target_path}")
+        if target_path.exists() and target_path.stat().st_size > 1024:
+            logger.warning(f"Using existing local file at {target_path}")
+        else:
+            raise RuntimeError(
+                f"Could not download official Perovskite Database CSV from {RAW_URLS}. "
+                "Please ensure internet connectivity or place Perovskite_database_content_all_data.csv in data/raw/."
+            )
 
     return target_path
 
 
-def generate_realistic_perovskite_dataset(n_samples: int = 12000, seed: int = 42) -> pd.DataFrame:
-    """
-    Generate high-fidelity perovskite dataset matching the distribution of the Perovskite Database Project
-    and the physical models described in Khan et al. (2026) and Liu et al. (2024).
-    """
-    rng = np.random.RandomState(seed)
-    n_dois = n_samples // 8
-    dois = [f"10.1016/j.solmat.202{rng.randint(0, 5)}.{i:05d}" for i in range(n_dois)]
-    
-    records = []
-    for i in range(n_samples):
-        doi = dois[rng.randint(0, n_dois)]
-        # Stack architecture: 65% n-i-p, 35% p-i-n
-        arch = 'nip' if rng.rand() < 0.65 else 'pin'
-        compat = COMPATIBILITY_DICT[arch]
-        
-        etl = rng.choice(compat['etl'])
-        htl = rng.choice(compat['htl'])
-        tco = rng.choice(compat['tco'])
-        back_contact = rng.choice(compat['back_contact'])
-        
-        # A-site composition (FA, MA, Cs)
-        comp_type = rng.choice(['single_MA', 'mixed_FA_MA', 'triple_cation', 'pure_Cs'], p=[0.35, 0.35, 0.25, 0.05])
-        if comp_type == 'single_MA':
-            x_FA, x_MA, x_Cs = 0.0, 1.0, 0.0
-        elif comp_type == 'mixed_FA_MA':
-            fa_val = rng.uniform(0.6, 0.9)
-            x_FA, x_MA, x_Cs = fa_val, 1.0 - fa_val, 0.0
-        elif comp_type == 'triple_cation':
-            cs_val = rng.uniform(0.05, 0.15)
-            fa_val = rng.uniform(0.65, 0.85) * (1.0 - cs_val)
-            ma_val = 1.0 - cs_val - fa_val
-            x_FA, x_MA, x_Cs = fa_val, ma_val, cs_val
-        else:
-            x_FA, x_MA, x_Cs = 0.0, 0.0, 1.0
-            
-        # B-site composition (Pb, Sn)
-        is_low_pb = rng.rand() < 0.25
-        if is_low_pb:
-            x_Pb = rng.uniform(0.0, 0.5)
-        else:
-            x_Pb = rng.uniform(0.8, 1.0)
-        x_Sn = 1.0 - x_Pb
-        
-        # X-site composition (I, Br, Cl)
-        x_type = rng.choice(['pure_I', 'mixed_I_Br', 'mixed_I_Br_Cl'], p=[0.7, 0.25, 0.05])
-        if x_type == 'pure_I':
-            x_I, x_Br, x_Cl = 1.0, 0.0, 0.0
-        elif x_type == 'mixed_I_Br':
-            br_val = rng.uniform(0.05, 0.35)
-            x_I, x_Br, x_Cl = 1.0 - br_val, br_val, 0.0
-        else:
-            cl_val = rng.uniform(0.01, 0.05)
-            br_val = rng.uniform(0.05, 0.25)
-            x_I = 1.0 - br_val - cl_val
-            x_Br, x_Cl = br_val, cl_val
-            
-        # Optical bandgap (Vegard's law with bowing + cation effect)
-        Eg_base = 1.48 * x_I + 2.28 * x_Br + 2.97 * x_Cl - 0.33 * x_I * x_Br
-        # Sn red-shifts bandgap (down to ~1.2 eV for Pb-Sn alloys)
-        Eg_base = Eg_base - 0.35 * x_Sn * (1.0 - 0.5 * x_Sn)
-        # FA lowers bandgap slightly, Cs increases it
-        Eg = Eg_base - 0.05 * x_FA + 0.12 * x_Cs + rng.normal(0, 0.02)
-        Eg = np.clip(Eg, 1.15, 2.50)
-        
-        # Energy offsets
-        # Delta_H: perovskite VBM to HTL HOMO offset
-        # Delta_L: perovskite CBM to ETL LUMO offset
-        Delta_H = np.clip(rng.normal(0.25, 0.15), -0.2, 0.8)
-        Delta_L = np.clip(rng.normal(0.20, 0.12), -0.2, 0.7)
-        
-        # Geometry & thicknesses (nm)
-        absorber_t = rng.uniform(250.0, 750.0)
-        etl_t = rng.uniform(20.0, 80.0)
-        htl_t = rng.uniform(30.0, 180.0)
-        
-        # Photovoltaic parameters based on physical Shockley-Queisser ceiling + loss channels
-        # Jsc_max depends on Eg: AM1.5G photon flux above bandgap
-        Jsc_limit = 45.0 * (1.0 - np.exp(-1.4 * (Eg - 0.3)))
-        Jsc_optical_loss = (1.0 - np.exp(-absorber_t / 350.0))
-        Jsc_rec_loss = 1.0 - 0.15 * x_Sn - 0.10 * max(0, Delta_L - 0.3)
-        Jsc = Jsc_limit * Jsc_optical_loss * Jsc_rec_loss * rng.uniform(0.85, 0.98)
-        
-        # Voc limit: Eg - radiative loss (typically ~0.25-0.3 V below Eg/q)
-        Voc_limit = Eg - 0.30
-        Voc_offset_loss = 0.5 * max(0, Delta_H - 0.2) + 0.5 * max(0, Delta_L - 0.2)
-        Voc_trap_loss = 0.12 * x_Sn + 0.08 * (1.0 if x_Cs < 0.02 else 0.0)
-        Voc = (Voc_limit - Voc_offset_loss - Voc_trap_loss) * rng.uniform(0.82, 0.97)
-        Voc = np.clip(Voc, 0.50, 1.35)
-        
-        # Fill Factor: ideal ~0.83-0.86, reduced by series resistance and offsets
-        FF_ideal = 0.84
-        FF_loss = 0.05 * (absorber_t / 500.0 - 1.0)**2 + 0.08 * (Delta_H**2 + Delta_L**2) + 0.06 * x_Sn
-        FF = np.clip(FF_ideal - FF_loss + rng.normal(0, 0.03), 0.45, 0.88)
-        
-        # PCE = Jsc * Voc * FF (with Pin = 100 mW/cm^2 -> PCE in %)
-        PCE = (Jsc * Voc * FF)
-        PCE = np.clip(PCE + rng.normal(0, 0.2), 0.5, 27.5)
-        
-        records.append({
-            'Ref_DOI': doi,
-            'Cell_architecture': arch,
-            'x_FA': round(float(x_FA), 4),
-            'x_MA': round(float(x_MA), 4),
-            'x_Cs': round(float(x_Cs), 4),
-            'x_Pb': round(float(x_Pb), 4),
-            'x_Sn': round(float(x_Sn), 4),
-            'x_I': round(float(x_I), 4),
-            'x_Br': round(float(x_Br), 4),
-            'x_Cl': round(float(x_Cl), 4),
-            'Eg': round(float(Eg), 3),
-            'Delta_H': round(float(Delta_H), 3),
-            'Delta_L': round(float(Delta_L), 3),
-            'absorber_thickness': round(float(absorber_t), 1),
-            'etl_thickness': round(float(etl_t), 1),
-            'htl_thickness': round(float(htl_t), 1),
-            'etl_material': etl,
-            'htl_material': htl,
-            'substrate': tco,
-            'back_contact': back_contact,
-            'Voc': round(float(Voc), 4),
-            'Jsc': round(float(Jsc), 3),
-            'FF': round(float(FF), 4),
-            'PCE': round(float(PCE), 3),
-        })
-        
-    return pd.DataFrame(records)
+def parse_ion_fractions(ions_str: Any, coeffs_str: Any, target_ions: List[str]) -> Dict[str, float]:
+    """Parse ion and coefficient strings from Perovskite Database into normalized site fractions."""
+    fractions = {ion: 0.0 for ion in target_ions}
+    if pd.isna(ions_str) or not str(ions_str).strip():
+        fractions[target_ions[0]] = 1.0
+        return fractions
+
+    raw_ions = [s.strip() for s in re.split(r'[;,|]', str(ions_str)) if s.strip()]
+    if pd.isna(coeffs_str) or not str(coeffs_str).strip():
+        raw_coeffs = [1.0] * len(raw_ions)
+    else:
+        raw_coeffs = []
+        for c in re.split(r'[;,|]', str(coeffs_str)):
+            try:
+                raw_coeffs.append(float(c.strip()))
+            except:
+                raw_coeffs.append(1.0)
+
+    if len(raw_coeffs) < len(raw_ions):
+        raw_coeffs.extend([1.0] * (len(raw_ions) - len(raw_coeffs)))
+
+    total = 0.0
+    for ion_name, coeff in zip(raw_ions, raw_coeffs):
+        clean_name = ion_name.upper().replace('+', '').replace('-', '').strip()
+        for t in target_ions:
+            if t.upper() in clean_name or clean_name in t.upper():
+                fractions[t] += max(0.0, coeff)
+                total += max(0.0, coeff)
+                break
+
+    if total > 0.0:
+        for t in target_ions:
+            fractions[t] /= total
+    else:
+        fractions[target_ions[0]] = 1.0
+
+    return fractions
+
+
+def canonicalize_etl(raw_val: Any, arch: str) -> str:
+    """Map raw ETL stack sequence string to canonical vocabulary in COMPATIBILITY_DICT."""
+    val = str(raw_val).lower() if not pd.isna(raw_val) else ''
+    if 'pcbm' in val or 'pc61bm' in val:
+        return 'PCBM-60'
+    elif 'c60' in val:
+        return 'C60'
+    elif 'bcp' in val:
+        return 'BCP'
+    elif 'sno2' in val:
+        return 'SnO2-np'
+    elif 'tio2' in val and 'mp' in val:
+        return 'TiO2-mp'
+    elif 'tio2' in val:
+        return 'TiO2-c'
+    elif 'zno' in val:
+        return 'ZnO-np'
+    elif 'in2o3' in val:
+        return 'In2O3'
+    elif 'nb2o5' in val:
+        return 'Nb2O5'
+    elif 'ceo2' in val:
+        return 'CeO2'
+    return 'TiO2-c' if arch == 'nip' else 'PCBM-60'
+
+
+def canonicalize_htl(raw_val: Any, arch: str) -> str:
+    """Map raw HTL stack sequence string to canonical vocabulary in COMPATIBILITY_DICT."""
+    val = str(raw_val).lower() if not pd.isna(raw_val) else ''
+    if 'spiro' in val:
+        return 'Spiro-OMeTAD'
+    elif 'pedot' in val:
+        return 'PEDOT:PSS'
+    elif 'ptaa' in val:
+        return 'PTAA'
+    elif 'p3ht' in val:
+        return 'P3HT'
+    elif 'nio' in val:
+        return 'NiO-cp'
+    elif 'cuscn' in val:
+        return 'CuSCN'
+    elif 'cui' in val:
+        return 'CuI'
+    elif 'cu2o' in val:
+        return 'Cu2O'
+    elif 'poly' in val:
+        return 'PolyTPD'
+    elif 'pacz' in val:
+        return 'Me-4PACz'
+    return 'Spiro-OMeTAD' if arch == 'nip' else 'PEDOT:PSS'
+
+
+def canonicalize_substrate(raw_val: Any) -> str:
+    """Map raw substrate string to canonical FTO or ITO."""
+    val = str(raw_val).lower() if not pd.isna(raw_val) else ''
+    if 'ito' in val:
+        return 'ITO'
+    return 'FTO'
+
+
+def parse_numeric_thickness(val: Any, default: float, lo: float, hi: float) -> float:
+    """Extract numeric thickness from text string with bounds check."""
+    if pd.isna(val):
+        return default
+    m = re.search(r'(\d+\.?\d*)', str(val))
+    if m:
+        v = float(m.group(1))
+        if lo <= v <= hi:
+            return v
+    return default
 
 
 def parse_and_standardize(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """Parse raw database columns into clean standardized schema."""
+    """
+    Parse raw database columns into clean standardized schema.
+    Handles official Perovskite Database column naming:
+    Perovskite_composition_a_ions/coefficients, JV_default_PCE/Voc/Jsc/FF, etc.
+    """
     df = df_raw.copy()
     initial_count = len(df)
     logger.info(f"Step 1: Input raw dataset has {initial_count} rows.")
 
-    # Standardize column names if raw database columns exist
-    col_mapping = {
-        'Ref_DOI_number': 'Ref_DOI',
-        'Ref_DOI': 'Ref_DOI',
-        'Cell_architecture': 'Cell_architecture',
-        'JV_default_PCE': 'PCE',
-        'JV_default_Voc': 'Voc',
-        'JV_default_Jsc': 'Jsc',
-        'JV_default_FF': 'FF',
-        'Perovskite_band_gap': 'Eg',
-        'Perovskite_thickness': 'absorber_thickness',
-        'ETL_stack_sequence': 'etl_material',
-        'HTL_stack_sequence': 'htl_material',
-        'ETL_thickness_list': 'etl_thickness',
-        'HTL_thickness_list': 'htl_thickness',
-        'Substrate_stack_sequence': 'substrate',
-    }
-    
-    for raw_c, target_c in col_mapping.items():
-        if raw_c in df.columns and target_c not in df.columns:
-            df[target_c] = df[raw_c]
+    # 1. DOI
+    if 'Ref_DOI_number' in df.columns:
+        df['Ref_DOI'] = df['Ref_DOI_number'].fillna('UNKNOWN_DOI').astype(str)
+    elif 'Ref_DOI' not in df.columns:
+        df['Ref_DOI'] = 'UNKNOWN_DOI'
+
+    # 2. Architecture: nip vs pin
+    if 'Cell_architecture' in df.columns:
+        df['cell_arch'] = df['Cell_architecture'].astype(str).str.lower().apply(
+            lambda x: 'pin' if 'pin' in x or 'inverted' in x else 'nip'
+        )
+    else:
+        df['cell_arch'] = 'nip'
+    df['is_pin'] = (df['cell_arch'] == 'pin').astype(float)
+
+    # 3. Composition parsing: A, B, X site fractions
+    if 'Perovskite_composition_a_ions' in df.columns:
+        logger.info("Parsing official ion composition strings...")
+        a_site_list = [
+            parse_ion_fractions(i, c, ['FA', 'MA', 'Cs'])
+            for i, c in zip(df['Perovskite_composition_a_ions'], df['Perovskite_composition_a_ions_coefficients'])
+        ]
+        b_site_list = [
+            parse_ion_fractions(i, c, ['Pb', 'Sn'])
+            for i, c in zip(df['Perovskite_composition_b_ions'], df['Perovskite_composition_b_ions_coefficients'])
+        ]
+        c_site_list = [
+            parse_ion_fractions(i, c, ['I', 'Br', 'Cl'])
+            for i, c in zip(df['Perovskite_composition_c_ions'], df['Perovskite_composition_c_ions_coefficients'])
+        ]
+
+        df_a = pd.DataFrame(a_site_list, index=df.index)
+        df_b = pd.DataFrame(b_site_list, index=df.index)
+        df_c = pd.DataFrame(c_site_list, index=df.index)
+
+        df['x_FA'] = df_a['FA']
+        df['x_MA'] = df_a['MA']
+        df['x_Cs'] = df_a['Cs']
+        df['x_Pb'] = df_b['Pb']
+        df['x_Sn'] = df_b['Sn']
+        df['x_I'] = df_c['I']
+        df['x_Br'] = df_c['Br']
+        df['x_Cl'] = df_c['Cl']
 
     # Ensure required composition columns exist
     comp_cols = ['x_FA', 'x_MA', 'x_Cs', 'x_Pb', 'x_Sn', 'x_I', 'x_Br', 'x_Cl']
@@ -260,42 +282,76 @@ def parse_and_standardize(df_raw: pd.DataFrame) -> pd.DataFrame:
     for c in ['x_I', 'x_Br', 'x_Cl']:
         df[c] = df[c] / x_sum
 
-    # Standardize FF to [0, 1] range if in percentage
+    # 4. PV Targets in PHYSICAL UNITS
+    col_mapping = {
+        'JV_default_PCE': 'PCE',
+        'JV_default_Voc': 'Voc',
+        'JV_default_Jsc': 'Jsc',
+        'JV_default_FF': 'FF',
+    }
+    for raw_c, target_c in col_mapping.items():
+        if raw_c in df.columns and target_c not in df.columns:
+            df[target_c] = pd.to_numeric(df[raw_c], errors='coerce')
+        elif target_c in df.columns:
+            df[target_c] = pd.to_numeric(df[target_c], errors='coerce')
+
+    # Standardize FF to [0, 1] range if expressed as percentage
     if 'FF' in df.columns:
         df.loc[df['FF'] > 1.0, 'FF'] = df.loc[df['FF'] > 1.0, 'FF'] / 100.0
 
-    # Architecture standard: 'nip' or 'pin'
-    if 'Cell_architecture' in df.columns:
-        df['cell_arch'] = df['Cell_architecture'].astype(str).str.lower().apply(
-            lambda x: 'pin' if 'pin' in x or 'inverted' in x else 'nip'
-        )
-    else:
-        df['cell_arch'] = 'nip'
+    # 5. Device layers & materials
+    if 'ETL_stack_sequence' in df.columns:
+        df['etl_material'] = [canonicalize_etl(val, arch) for val, arch in zip(df['ETL_stack_sequence'], df['cell_arch'])]
+    elif 'etl_material' not in df.columns:
+        df['etl_material'] = np.where(df['cell_arch'] == 'nip', 'TiO2-c', 'PCBM-60')
 
-    df['is_pin'] = (df['cell_arch'] == 'pin').astype(float)
-    
-    # Fill energy offsets if missing
+    if 'HTL_stack_sequence' in df.columns:
+        df['htl_material'] = [canonicalize_htl(val, arch) for val, arch in zip(df['HTL_stack_sequence'], df['cell_arch'])]
+    elif 'htl_material' not in df.columns:
+        df['htl_material'] = np.where(df['cell_arch'] == 'nip', 'Spiro-OMeTAD', 'PEDOT:PSS')
+
+    if 'Substrate_stack_sequence' in df.columns:
+        df['substrate'] = df['Substrate_stack_sequence'].apply(canonicalize_substrate)
+    elif 'substrate' not in df.columns:
+        df['substrate'] = 'FTO'
+
+    # 6. Thicknesses (nm)
+    if 'Perovskite_thickness' in df.columns:
+        df['absorber_thickness'] = df['Perovskite_thickness'].apply(lambda x: parse_numeric_thickness(x, default=450.0, lo=100.0, hi=1200.0))
+    elif 'absorber_thickness' not in df.columns:
+        df['absorber_thickness'] = 450.0
+
+    if 'ETL_thickness' in df.columns:
+        df['etl_thickness'] = df['ETL_thickness'].apply(lambda x: parse_numeric_thickness(x, default=50.0, lo=10.0, hi=300.0))
+    elif 'etl_thickness' not in df.columns:
+        df['etl_thickness'] = 50.0
+
+    if 'HTL_thickness_list' in df.columns:
+        df['htl_thickness'] = df['HTL_thickness_list'].apply(lambda x: parse_numeric_thickness(x, default=100.0, lo=10.0, hi=300.0))
+    elif 'HTL_thickness' in df.columns:
+        df['htl_thickness'] = df['HTL_thickness'].apply(lambda x: parse_numeric_thickness(x, default=100.0, lo=10.0, hi=300.0))
+    elif 'htl_thickness' not in df.columns:
+        df['htl_thickness'] = 100.0
+
+    # 7. Bandgap Eg (eV)
+    vegard_eg = (
+        1.48 * df['x_I'] + 2.28 * df['x_Br'] + 2.97 * df['x_Cl'] -
+        0.33 * df['x_I'] * df['x_Br'] - 0.35 * df['x_Sn']
+    )
+    if 'Perovskite_band_gap' in df.columns:
+        df['Eg'] = pd.to_numeric(df['Perovskite_band_gap'], errors='coerce')
+        df['Eg'] = np.where((df['Eg'] < 1.0) | (df['Eg'] > 3.5) | df['Eg'].isna(), vegard_eg, df['Eg'])
+    elif 'Eg' in df.columns:
+        df['Eg'] = pd.to_numeric(df['Eg'], errors='coerce')
+        df['Eg'] = np.where((df['Eg'] < 1.0) | (df['Eg'] > 3.5) | df['Eg'].isna(), vegard_eg, df['Eg'])
+    else:
+        df['Eg'] = vegard_eg
+
+    # 8. Energy offsets Delta_H and Delta_L
     if 'Delta_H' not in df.columns:
         df['Delta_H'] = 0.25
     if 'Delta_L' not in df.columns:
         df['Delta_L'] = 0.20
-
-    # Ensure thickness columns are numeric
-    for tc in ['absorber_thickness', 'etl_thickness', 'htl_thickness']:
-        if tc in df.columns:
-            df[tc] = pd.to_numeric(df[tc].astype(str).str.extract(r'(\d+\.?\d*)')[0], errors='coerce')
-            df[tc] = df[tc].fillna(df[tc].median() if not df[tc].isna().all() else 100.0)
-        else:
-            df[tc] = 100.0
-
-    # Ensure Bandgap Eg exists
-    if 'Eg' in df.columns:
-        df['Eg'] = pd.to_numeric(df['Eg'], errors='coerce')
-        # Vegard estimate fallback if missing
-        vegard_eg = 1.48 * df['x_I'] + 2.28 * df['x_Br'] + 2.97 * df['x_Cl'] - 0.33 * df['x_I'] * df['x_Br'] - 0.35 * df['x_Sn']
-        df['Eg'] = df['Eg'].fillna(vegard_eg)
-    else:
-        df['Eg'] = 1.48 * df['x_I'] + 2.28 * df['x_Br'] + 2.97 * df['x_Cl'] - 0.33 * df['x_I'] * df['x_Br'] - 0.35 * df['x_Sn']
 
     return df
 
@@ -306,7 +362,7 @@ def clean_and_filter(df: pd.DataFrame, mad_z_thresh: float = 4.0) -> pd.DataFram
     logger.info(f"Step 2: Filtering on {n_start} rows.")
 
     # 1. Deduplication
-    core_cols = ['x_FA', 'x_MA', 'x_Cs', 'x_Pb', 'x_Sn', 'x_I', 'x_Br', 'x_Cl', 'PCE', 'Voc', 'Jsc', 'FF']
+    core_cols = ['Ref_DOI', 'x_FA', 'x_MA', 'x_Cs', 'x_Pb', 'x_Sn', 'x_I', 'x_Br', 'x_Cl', 'PCE', 'Voc', 'Jsc', 'FF']
     avail_core = [c for c in core_cols if c in df.columns]
     df = df.drop_duplicates(subset=avail_core).copy()
     logger.info(f"  After deduplication: {len(df)} rows (removed {n_start - len(df)} duplicates)")
@@ -315,7 +371,7 @@ def clean_and_filter(df: pd.DataFrame, mad_z_thresh: float = 4.0) -> pd.DataFram
     n_before = len(df)
     for target, (lo, hi) in PHYSICAL_BOUNDS.items():
         if target in df.columns:
-            mask = (df[target] > lo) & (df[target] <= hi)
+            mask = (df[target] > lo) & (df[target] <= hi) & df[target].notna()
             df = df[mask].copy()
     logger.info(f"  After physical bounds filtering: {len(df)} rows (removed {n_before - len(df)} out-of-bounds)")
 
@@ -403,59 +459,95 @@ def doi_grouped_train_val_test_split(
 class LeakageFreePreprocessor:
     """
     Strictly fit all imputers, scalers, and encoders on the training split only.
-    Applies the fitted transformations to validation, testing, and new inverse candidates.
+    Applies fitted transformations to validation, testing, and new inverse candidates.
+    CRITICAL: Preserves targets in PHYSICAL UNITS (PCE in %, Voc in V, Jsc in mA/cm^2, FF in [0, 1]).
     """
     def __init__(self):
         self.feature_cols: List[str] = []
+        self.numeric_feature_cols: List[str] = []
+        self.cat_cols: List[str] = ['etl_material', 'htl_material', 'substrate']
         self.target_cols: List[str] = ['PCE', 'Voc', 'Jsc', 'FF']
+        
         self.numeric_imputer = SimpleImputer(strategy='median')
         self.feature_scaler = StandardScaler()
-        self.target_scaler = StandardScaler()
         self.label_encoders: Dict[str, LabelEncoder] = {}
+        
+        # Target statistics (mean and std) stored for physical loss weighting, but targets are NOT standardized
+        self.target_means: np.ndarray = np.zeros(4)
+        self.target_stds: np.ndarray = np.ones(4)
         self.is_fitted: bool = False
 
     def fit(self, train_df: pd.DataFrame, feature_cols: List[str]) -> 'LeakageFreePreprocessor':
         self.feature_cols = [c for c in feature_cols if c in train_df.columns]
         
+        # Separate numeric and categorical
+        self.numeric_feature_cols = [
+            c for c in self.feature_cols if c not in self.cat_cols and pd.api.types.is_numeric_dtype(train_df[c])
+        ]
+        
         # Fit numeric feature transformations
-        X_num = train_df[self.feature_cols].select_dtypes(include=[np.number]).values
+        X_num = train_df[self.numeric_feature_cols].values
         self.numeric_imputer.fit(X_num)
         X_imp = self.numeric_imputer.transform(X_num)
         self.feature_scaler.fit(X_imp)
 
-        # Fit target scaler
-        y = train_df[self.target_cols].values
-        self.target_scaler.fit(y)
+        # Fit categorical encoders on training data only
+        for c in self.cat_cols:
+            if c in train_df.columns:
+                le = LabelEncoder()
+                unique_vals = list(train_df[c].dropna().astype(str).unique()) + ['<UNKNOWN>']
+                le.fit(unique_vals)
+                self.label_encoders[c] = le
 
-        # Fit categorical encoders
-        cat_cols = train_df[self.feature_cols].select_dtypes(exclude=[np.number]).columns
-        for c in cat_cols:
-            le = LabelEncoder()
-            le.fit(train_df[c].astype(str).tolist() + ['<UNKNOWN>'])
-            self.label_encoders[c] = le
+        # Store target statistics in physical units
+        if all(t in train_df.columns for t in self.target_cols):
+            y = train_df[self.target_cols].values
+            self.target_means = np.mean(y, axis=0)
+            self.target_stds = np.std(y, axis=0) + 1e-4
 
         self.is_fitted = True
         return self
 
     def transform(self, df: pd.DataFrame) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """
+        Transform features and extract targets.
+        Returns:
+            X_transformed: (N, n_features) with standardized numeric features + encoded categorical features
+            y_physical: (N, 4) targets strictly in PHYSICAL UNITS (PCE, Voc, Jsc, FF)
+        """
         assert self.is_fitted, "Preprocessor must be fitted first!"
-        
-        # Numeric transform
-        X_num = df[self.feature_cols].select_dtypes(include=[np.number]).values
+
+        # 1. Numeric features (imputed and standardized)
+        X_num = df[self.numeric_feature_cols].values
         X_imp = self.numeric_imputer.transform(X_num)
         X_scaled = self.feature_scaler.transform(X_imp)
 
-        # Targets transform if present
-        if all(t in df.columns for t in self.target_cols):
-            y = df[self.target_cols].values
-            y_scaled = self.target_scaler.transform(y)
+        # 2. Categorical features (encoded using train-fitted label encoders)
+        cat_encoded_list = []
+        for c in self.cat_cols:
+            if c in self.label_encoders and c in df.columns:
+                le = self.label_encoders[c]
+                vals = df[c].fillna('<UNKNOWN>').astype(str).values
+                # Map unseen values to <UNKNOWN>
+                known_classes = set(le.classes_)
+                vals_mapped = [v if v in known_classes else '<UNKNOWN>' for v in vals]
+                encoded = le.transform(vals_mapped).reshape(-1, 1).astype(float)
+                # Normalize encoded integers to [0, 1] range
+                encoded = encoded / max(len(le.classes_), 1.0)
+                cat_encoded_list.append(encoded)
+
+        if cat_encoded_list:
+            X_all = np.hstack([X_scaled] + cat_encoded_list)
         else:
-            y_scaled = None
+            X_all = X_scaled
 
-        return X_scaled.astype(np.float32), (y_scaled.astype(np.float32) if y_scaled is not None else None)
+        # 3. Targets: STRICTLY IN PHYSICAL UNITS (No StandardScaler)
+        if all(t in df.columns for t in self.target_cols):
+            y_physical = df[self.target_cols].values.astype(np.float32)
+        else:
+            y_physical = None
 
-    def inverse_transform_targets(self, y_scaled: np.ndarray) -> np.ndarray:
-        return self.target_scaler.inverse_transform(y_scaled)
+        return X_all.astype(np.float32), y_physical
 
     def save(self, filepath: Path) -> None:
         filepath = Path(filepath)

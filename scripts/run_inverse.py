@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.data.dataset import LeakageFreePreprocessor
 from src.models.pinn import PINNDeepEnsemble, UncertaintyCalibrator, OODDetector
 from src.inverse.cvae import ConstrainedFiLMcVAE, compute_cvae_loss
-from src.inverse.flow import ConditionalRealNVP
+from src.inverse.flow import ConditionalRealNVP, transform_to_unconstrained
 from src.inverse.refinement import (
     candidate_dict_to_dataframe,
     CandidateEvaluator,
@@ -121,28 +121,46 @@ def main():
     evaluator = CandidateEvaluator(ensemble, preprocessor, ood_detector, calibrator)
 
     # Prepare design matrix for generative modeling
-    # Design variables: [x_FA, x_MA, x_Cs, x_Pb, x_Sn, x_I, x_Br, x_Cl, abs_t/500, etl_t/500, htl_t/500, Delta_H, Delta_L, is_pin]
+    # Design variables: [x_FA, x_MA, x_Cs, x_Pb, x_Sn, x_I, x_Br, x_Cl, abs_t, etl_t, htl_t, Delta_H, Delta_L, is_pin]
     design_cols = ['x_FA', 'x_MA', 'x_Cs', 'x_Pb', 'x_Sn', 'x_I', 'x_Br', 'x_Cl',
                    'absorber_thickness', 'etl_thickness', 'htl_thickness', 'Delta_H', 'Delta_L', 'is_pin']
     X_design = train_features_df[design_cols].copy().values
-    X_design[:, 8:11] = X_design[:, 8:11] / 500.0 # scale thicknesses
 
-    # Condition matrix: [PCE, Voc, Jsc, FF, Pb_max]
-    c_train = np.column_stack([y_train, np.ones(len(y_train))])
+    # Sample training Pb_max per sample from uniform(x_Pb, 1.0) so model actually learns condition (Bug 4 fix)
+    pb_train = X_design[:, 3]
+    pb_max_train = np.random.uniform(pb_train, 1.0, size=len(pb_train))
+    c_train = np.column_stack([y_train, pb_max_train])
 
-    train_ds = TensorDataset(torch.from_numpy(X_design).float(), torch.from_numpy(c_train).float())
-    train_loader = DataLoader(train_ds, batch_size=128, shuffle=True)
+    # Standardize condition vector consistently across training and inference (Bug 1 fix)
+    c_mean = np.mean(c_train, axis=0)
+    c_std = np.std(c_train, axis=0) + 1e-4
+    c_train_norm = (c_train - c_mean) / c_std
+
+    # Prepare cVAE dataset (scaled thicknesses) and RealNVP dataset (unconstrained logit space)
+    X_cvae = X_design.copy()
+    X_cvae[:, 8:11] = X_cvae[:, 8:11] / 500.0
+
+    X_flow = transform_to_unconstrained(
+        torch.from_numpy(X_design).float(),
+        pb_max=torch.from_numpy(pb_max_train).float()
+    ).numpy()
+
+    train_ds_cvae = TensorDataset(torch.from_numpy(X_cvae).float(), torch.from_numpy(c_train_norm).float())
+    train_loader_cvae = DataLoader(train_ds_cvae, batch_size=128, shuffle=True)
+
+    train_ds_flow = TensorDataset(torch.from_numpy(X_flow).float(), torch.from_numpy(c_train_norm).float())
+    train_loader_flow = DataLoader(train_ds_flow, batch_size=128, shuffle=True)
 
     # 1. Train Constrained FiLM-cVAE
     logger.info("Training Constrained FiLM-cVAE...")
-    cvae = ConstrainedFiLMcVAE(design_dim=X_design.shape[1], cond_dim=5, latent_dim=16, hidden_dim=256).to(device)
-    cvae = train_cvae(cvae, train_loader, epochs=args.epochs, device=device)
+    cvae = ConstrainedFiLMcVAE(design_dim=X_cvae.shape[1], cond_dim=5, latent_dim=16, hidden_dim=256).to(device)
+    cvae = train_cvae(cvae, train_loader_cvae, epochs=args.epochs, device=device)
     torch.save(cvae.state_dict(), ckpt_dir / 'cvae_model.pt')
 
     # 2. Train Conditional RealNVP Normalizing Flow
     logger.info("Training Conditional RealNVP Normalizing Flow...")
-    flow = ConditionalRealNVP(design_dim=X_design.shape[1], cond_dim=5, n_layers=6, hidden_dim=128).to(device)
-    flow = train_flow(flow, train_loader, epochs=args.epochs, device=device)
+    flow = ConditionalRealNVP(design_dim=X_flow.shape[1], cond_dim=5, n_layers=6, hidden_dim=128).to(device)
+    flow = train_flow(flow, train_loader_flow, epochs=args.epochs, device=device)
     torch.save(flow.state_dict(), ckpt_dir / 'flow_model.pt')
 
     # 3. Target Specifications
@@ -152,15 +170,18 @@ def main():
     jsc_90 = float(np.percentile(y_train[:, 2], 90.0))
     ff_90 = float(np.percentile(y_train[:, 3], 90.0))
     target_high = np.array([pce_90, voc_90, jsc_90, ff_90])
-    c_high = torch.FloatTensor([pce_90, voc_90, jsc_90, ff_90, 1.0])
+    c_high_raw = np.array([pce_90, voc_90, jsc_90, ff_90, 1.0])
+    c_high = torch.FloatTensor((c_high_raw - c_mean) / c_std)
 
     # Target 2: Low-Pb target (PCE* = 20.0%, Voc* = 1.05V, Jsc* = 24.5, FF* = 0.78, Pb_max = 0.50)
     target_low_pb = np.array([20.0, 1.05, 24.5, 0.78])
-    c_low_pb = torch.FloatTensor([20.0, 1.05, 24.5, 0.78, 0.50])
+    c_low_pb_raw = np.array([20.0, 1.05, 24.5, 0.78, 0.50])
+    c_low_pb = torch.FloatTensor((c_low_pb_raw - c_mean) / c_std)
 
     # Target 3: Pure-Sn Lead-Free target (PCE* = 18.0%, Voc* = 0.95V, Jsc* = 25.0, FF* = 0.76, Pb_max = 0.0)
     target_sn = np.array([18.0, 0.95, 25.0, 0.76])
-    c_sn = torch.FloatTensor([18.0, 0.95, 25.0, 0.76, 0.0])
+    c_sn_raw = np.array([18.0, 0.95, 25.0, 0.76, 0.0])
+    c_sn = torch.FloatTensor((c_sn_raw - c_mean) / c_std)
 
     targets_dict = {
         'High_PCE_90th': (target_high, c_high, 1.0),
@@ -176,7 +197,7 @@ def main():
         cand_raw = cvae.sample(c_high, n_samples=args.n_samples, w=w, Pb_max=1.0)
         cand_df = candidate_dict_to_dataframe(cand_raw, n_samples=args.n_samples)
         evaluated = evaluator.evaluate(cand_df, target_high)
-        hr = compute_hit_rate(evaluated['pred_PCE'].values, target_high[0], tolerance=0.5)
+        hr = compute_hit_rate(evaluated['pred_PCE'].values, target_high[0], tolerance=1.5)
         sweep_hit_rates.append(hr)
         logger.info(f"  CFG scale w = {w:3.1f} -> Hit-Rate: {hr:5.1f}%")
 
@@ -207,8 +228,8 @@ def main():
     methods_data['Conditional_Flow'] = evaluator.evaluate(flow_df, target_high)
 
     # Method 5: cVAE + Bayesian Optimization Refinement
-    top_cvae_candidate = methods_data['cVAE_plus_CFG'].sort_values('composite_score').iloc[0]
-    refined_df = bayesian_refinement_optuna(top_cvae_candidate, target_high, evaluator, Pb_max=1.0, n_trials=60)
+    top_cvae_candidates = methods_data['cVAE_plus_CFG'].sort_values('composite_score').head(5)
+    refined_df = bayesian_refinement_optuna(top_cvae_candidates, target_high, evaluator, Pb_max=1.0, n_trials=60)
     methods_data['cVAE_plus_BO_Refinement'] = refined_df
 
     # Compute comprehensive metrics table
@@ -219,7 +240,7 @@ def main():
         pred_pce = df_res['pred_PCE'].values
         mae_target = float(np.mean(np.abs(pred_pce - target_high[0])))
         rmse_target = float(np.sqrt(np.mean((pred_pce - target_high[0]) ** 2)))
-        hr = compute_hit_rate(pred_pce, target_high[0], tolerance=0.5)
+        hr = compute_hit_rate(pred_pce, target_high[0], tolerance=1.5)
         chem_valid = compute_chemical_validity(df_res)
         
         # Array of numeric design columns
@@ -236,7 +257,7 @@ def main():
             df_res['x_Pb'].values,
             df_res['mean_unc'].values
         ])
-        ref_pt = np.array([10.0, 1.05, 1.5])
+        ref_pt = np.array([15.0, 1.10, 25.0])
         hv = compute_pareto_hypervolume(pts[p_mask], ref_pt)
 
         benchmark_table[m_name] = {

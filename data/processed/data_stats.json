@@ -1,10 +1,10 @@
 {
-  "raw_rows": 12000,
-  "clean_rows": 12000,
-  "train_rows": 8404,
-  "val_rows": 1800,
-  "test_rows": 1796,
-  "train_dois": 1052,
-  "val_dois": 225,
-  "test_dois": 221
+  "raw_rows": 42443,
+  "clean_rows": 35639,
+  "train_rows": 24949,
+  "val_rows": 5349,
+  "test_rows": 5341,
+  "train_dois": 4905,
+  "val_dois": 1067,
+  "test_dois": 1075
 }
